@@ -8,13 +8,12 @@ from typing import List
 
 st.set_page_config(page_title="CSV Duplicate Checker by Phone", layout="wide")
 
+# ---------------------------- Helpers ----------------------------
 def normalize_phone(x: str) -> str:
     if pd.isna(x):
         return ""
     s = str(x)
-    # remove all non-digit characters
     digits = re.sub(r"\D", "", s)
-    # if it's longer than 10 digits, keep the last 10 (common heuristic for mobile numbers)
     if len(digits) > 10:
         digits = digits[-10:]
     return digits
@@ -22,19 +21,16 @@ def normalize_phone(x: str) -> str:
 def read_csv_file(uploaded_file) -> pd.DataFrame:
     uploaded_file.seek(0)
     raw = uploaded_file.read()
-    uploaded_file.seek(0)  # reset for pandas
-
-    # Try to decode and sniff delimiter
+    uploaded_file.seek(0)
     try:
         sample = raw.decode("utf-8", errors="ignore")
         dialect = csv.Sniffer().sniff(sample[:1024], delimiters=",;\t")
         delimiter = dialect.delimiter
     except Exception:
-        delimiter = ','  # fallback
+        delimiter = ','
 
     try:
         df = pd.read_csv(StringIO(sample), sep=delimiter, dtype=str, keep_default_na=False, engine="python")
-        # Strip spaces from headers
         df.columns = [c.strip() for c in df.columns]
         return df
     except Exception as e:
@@ -50,6 +46,7 @@ def create_download_link(df: pd.DataFrame, filename: str):
     towrite.seek(0)
     return st.download_button(label=f"Download cleaned: {filename}", data=towrite, file_name=filename, mime="text/csv")
 
+# ---------------------------- UI ----------------------------
 st.title("CSV Duplicate Checker — by Phone Number")
 st.markdown("""
 Upload **New** CSV file(s) and **Old** CSV file(s). The app will:
@@ -110,9 +107,9 @@ with tabs[0]:
                     st.error(f"Failed to process {f.name}: {e}")
 
             st.success(f"Total unique normalized phone numbers in Old files: {len(old_phones_set)}")
+            st.write("---")
 
             # Process each new file
-            st.write("---")
             for f in new_files:
                 try:
                     df_new = read_csv_file(f)
@@ -122,15 +119,22 @@ with tabs[0]:
                     mask_in_old = df_new["_normalized_phone_for_check"].isin(old_phones_set) & (df_new["_normalized_phone_for_check"].str.len()>0)
                     found_count = mask_in_old.sum()
                     st.write(f"Found {found_count} rows in `{f.name}` that match phones from Old files.")
+
                     cleaned_df = df_new.loc[~mask_in_old].drop(columns=["_normalized_phone_for_check"])
                     cleaned_name = f"update_{f.name}"
                     if cleaned_df.empty:
                         st.warning(f"After removing duplicates, `{cleaned_name}` is empty.")
                     else:
                         create_download_link(cleaned_df, cleaned_name)
+
+                    # Store removed rows in session state for checkbox preview
                     if found_count > 0:
-                        if st.checkbox(f"Show removed rows preview for `{f.name}`", key=f"show_removed_{f.name}"):
-                            st.dataframe(df_new.loc[mask_in_old].drop(columns=["_normalized_phone_for_check"]).head(200))
+                        key_removed = f"removed_rows_{f.name}"
+                        st.session_state[key_removed] = df_new.loc[mask_in_old].drop(columns=["_normalized_phone_for_check"])
+                        show_preview = st.checkbox(f"Show removed rows preview for `{f.name}`", key=f"show_removed_{f.name}")
+                        if show_preview and key_removed in st.session_state:
+                            st.dataframe(st.session_state[key_removed].head(200))
+
                 except Exception as e:
                     st.error(f"Failed to process {f.name}: {e}")
 
@@ -150,14 +154,22 @@ with tabs[1]:
             duplicated_mask = df_single["_normalized_phone_for_check"].duplicated(keep="first") & (df_single["_normalized_phone_for_check"].str.len()>0)
             total_duplicates = duplicated_mask.sum()
             st.write(f"Found {total_duplicates} duplicate rows (same normalized phone) inside the file.")
+
             cleaned_df = df_single.loc[~duplicated_mask].drop(columns=["_normalized_phone_for_check"])
             cleaned_name = f"update_{single_file.name}"
             if cleaned_df.empty:
                 st.warning("After removing duplicates, resulting file is empty.")
             else:
                 create_download_link(cleaned_df, cleaned_name)
-            if total_duplicates > 0 and st.checkbox("Show removed duplicate rows preview", key="preview_internal_removed"):
-                st.dataframe(df_single.loc[duplicated_mask].drop(columns=["_normalized_phone_for_check"]).head(200))
+
+            # Store removed rows for preview
+            if total_duplicates > 0:
+                key_removed_single = f"removed_rows_single"
+                st.session_state[key_removed_single] = df_single.loc[duplicated_mask].drop(columns=["_normalized_phone_for_check"])
+                show_preview_single = st.checkbox("Show removed duplicate rows preview", key="preview_internal_removed")
+                if show_preview_single and key_removed_single in st.session_state:
+                    st.dataframe(st.session_state[key_removed_single].head(200))
+
         except Exception as e:
             st.error(f"Failed to read or process file: {e}")
 
