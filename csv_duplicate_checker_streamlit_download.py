@@ -1,4 +1,4 @@
-# csv_tool_full.py
+# csv_tool_full_enhanced.py
 import streamlit as st
 import pandas as pd
 import io
@@ -6,33 +6,33 @@ import re
 import csv
 import requests
 import numpy as np
+import time
 from io import StringIO
+from typing import Tuple
 
-st.set_page_config(page_title="CSV Duplicate & Geofilter Checker", layout="wide")
+st.set_page_config(page_title="CSV Duplicate & Geofilter Checker (Enhanced)", layout="wide")
 
 # ------------------ Helpers ------------------
 
 def normalize_phone(x: str) -> str:
+    """Normalize phone by keeping digits only and last 10 digits if longer."""
     if pd.isna(x):
         return ""
     s = str(x)
     digits = re.sub(r"\D", "", s)
-    # keep last 10 digits if longer
     if len(digits) > 10:
         digits = digits[-10:]
     return digits
 
 def robust_read_csv(uploaded_file) -> pd.DataFrame:
-    """
-    Read uploaded file robustly: try to sniff delimiter and handle common encodings.
-    Returns a DataFrame (all columns as strings).
-    """
+    """Try various ways to robustly read csv/tsv files and strip headers."""
     uploaded_file.seek(0)
     raw = uploaded_file.read()
     uploaded_file.seek(0)
-    # try simple read first
+    # try utf-8 simple read
     try:
-        df = pd.read_csv(StringIO(raw.decode("utf-8")), dtype=str, keep_default_na=False)
+        sample = raw.decode("utf-8")
+        df = pd.read_csv(StringIO(sample), dtype=str, keep_default_na=False)
         df.columns = [c.strip() for c in df.columns]
         return df
     except Exception:
@@ -44,21 +44,34 @@ def robust_read_csv(uploaded_file) -> pd.DataFrame:
         dialect = csv.Sniffer().sniff(sample[:4096], delimiters=",;\t")
         delimiter = dialect.delimiter
     except Exception:
-        delimiter = ','
+        delimiter = ","
 
-    # try reading with detected delimiter
     try:
         df = pd.read_csv(StringIO(sample), sep=delimiter, dtype=str, keep_default_na=False, engine="python")
         df.columns = [c.strip() for c in df.columns]
         return df
     except Exception:
-        # fallback tries
+        # fallback trying semicolon or python engine
         uploaded_file.seek(0)
         try:
             return pd.read_csv(uploaded_file, sep=";", dtype=str, keep_default_na=False, engine="python")
         except Exception:
             uploaded_file.seek(0)
             return pd.read_csv(uploaded_file, engine="python", dtype=str, keep_default_na=False)
+
+def select_phone_column_auto(columns: list) -> str:
+    """Auto-select a phone-like column name if present in columns list."""
+    lowered = [c.lower() for c in columns]
+    priority = ["phone", "mobile", "contact", "telephone", "tel", "mob"]
+    for p in priority:
+        for i, c in enumerate(lowered):
+            if p in c:
+                return columns[i]
+    # fallback: return first column that looks numeric-ish in name
+    for i, c in enumerate(lowered):
+        if any(k in c for k in ["number", "no.", "num"]):
+            return columns[i]
+    return None
 
 def build_phone_series(df: pd.DataFrame, col: str) -> pd.Series:
     series = df[col].astype(str).fillna("")
@@ -73,245 +86,293 @@ def create_download_button(df: pd.DataFrame, filename: str, label: str = None):
     return st.download_button(label=label, data=towrite, file_name=filename, mime="text/csv")
 
 def haversine_np(lat1, lon1, lat2, lon2):
-    """Vectorized Haversine. lat1, lon1 are scalars; lat2, lon2 arrays/Series."""
+    """Vectorized Haversine. lat1/lon1 scalars, lat2/lon2 arrays or Series."""
     R = 6371.0  # km
     lat1_rad = np.radians(lat1)
     lon1_rad = np.radians(lon1)
-    lat2_rad = np.radians(lat2.astype(float))
-    lon2_rad = np.radians(lon2.astype(float))
+    lat2_rad = np.radians(pd.to_numeric(lat2, errors="coerce").astype(float))
+    lon2_rad = np.radians(pd.to_numeric(lon2, errors="coerce").astype(float))
     dlat = lat2_rad - lat1_rad
     dlon = lon2_rad - lon1_rad
     a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0) ** 2
     c = 2 * np.arcsin(np.sqrt(a))
     return R * c
 
-# Cache geocoding results. Use st.cache_data to persist across reruns.
+# ------------------ Geocoding backends ------------------
+
 @st.cache_data(show_spinner=False)
-def geocode_nominatim(query: str):
-    """
-    Query Nominatim and return (lat, lon) or (None, None).
-    We cache results to avoid repeated calls for the same address.
-    """
+def geocode_nominatim(query: str) -> Tuple[float, float]:
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": query, "format": "json", "limit": 1}
     try:
-        resp = requests.get(url, params=params, headers={"User-Agent": "csv-tool/1.0 (+https://example.com)"}, timeout=10)
+        resp = requests.get(url, params=params, headers={"User-Agent": "csv-tool/1.0"}, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             if data:
-                lat = float(data[0]["lat"])
-                lon = float(data[0]["lon"])
-                return lat, lon
+                return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception:
         pass
     return None, None
 
-# ------------------ Initialize session_state containers ------------------
+@st.cache_data(show_spinner=False)
+def geocode_locationiq(query: str, api_key: str) -> Tuple[float, float]:
+    # LocationIQ endpoint (forward geocoding)
+    # Docs: https://locationiq.com/docs
+    url = "https://us1.locationiq.com/v1/search.php"
+    params = {"key": api_key, "q": query, "format": "json", "limit": 1}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception:
+        pass
+    return None, None
+
+@st.cache_data(show_spinner=False)
+def geocode_opencage(query: str, api_key: str) -> Tuple[float, float]:
+    url = "https://api.opencagedata.com/geocode/v1/json"
+    params = {"q": query, "key": api_key, "limit": 1}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and data.get("results"):
+                res = data["results"][0]["geometry"]
+                return float(res["lat"]), float(res["lng"])
+    except Exception:
+        pass
+    return None, None
+
+def geocode_dispatch(query: str, provider: str, api_key: str = None) -> Tuple[float, float]:
+    """Dispatch geocoding to chosen provider; caches used via specific cached functions above."""
+    if provider == "nominatim":
+        return geocode_nominatim(query)
+    elif provider == "locationiq":
+        if not api_key:
+            return None, None
+        return geocode_locationiq(query, api_key)
+    elif provider == "opencage":
+        if not api_key:
+            return None, None
+        return geocode_opencage(query, api_key)
+    else:
+        return None, None
+
+# ------------------ Session state containers ------------------
 
 if "removed_rows" not in st.session_state:
-    st.session_state["removed_rows"] = {}      # stores removed rows per file (New vs Old)
+    st.session_state["removed_rows"] = {}
 if "removed_single" not in st.session_state:
-    st.session_state["removed_single"] = None  # stores removed rows for internal duplicate file
+    st.session_state["removed_single"] = None
 if "radius_results" not in st.session_state:
-    st.session_state["radius_results"] = {}    # store radius results per file: dict of {filename: (inside_df, outside_df)}
+    st.session_state["radius_results"] = {}
 
 # ------------------ App UI ------------------
 
-st.title("CSV Duplicate & Geofilter Checker")
+st.title("CSV Duplicate & Geofilter Checker — Enhanced")
 st.markdown("""
-**Features**
-- Compare New vs Old CSVs by phone number → remove matches from New files, preview removed rows, download cleaned files.  
+Features:
+- Compare New vs Old CSVs by phone (auto-detect phone columns, or choose manually).  
 - Internal duplicate remover (single file).  
-- Filter CSV rows within a radius of a reference point (by lat/lon or by address/pincode using Nominatim).  
+- Filter by radius using lat/lon or address+pincode with geocoding.  
+- Choose geocoding provider (Nominatim, LocationIQ, OpenCage) and supply API key if needed.  
+- Caches geocoding responses and shows progress for batch geocoding.
 """)
 
-tabs = st.tabs(["Compare New vs Old", "Internal Duplicate Remover", "Filter by Radius"])
+tabs = st.tabs(["Compare New vs Old", "Internal Duplicate Remover", "Filter by Radius", "Settings"])
+
+# ------------------ Settings tab ------------------
+with tabs[3]:
+    st.header("Settings")
+    st.markdown("**Geocoding provider & API keys**")
+    geo_provider = st.radio("Choose geocoding provider (default: Nominatim)", ["nominatim", "locationiq", "opencage"], index=0, key="provider_choice")
+    st.markdown("If you choose LocationIQ or OpenCage, paste your API key below (recommended for large datasets).")
+    loc_api_key = st.text_input("LocationIQ API key", value="", key="loc_key")
+    oc_api_key = st.text_input("OpenCage API key", value="", key="oc_key")
+    st.markdown("""
+    Recommendations:
+    - For small quick tests, **Nominatim** (free) is fine. Respect 1 request/sec.
+    - For larger batches, use **LocationIQ** (10k/month free tier) or **OpenCage** (free tier), enter API key above.
+    """)
+
+# Ensure provider selection is available in session for other tabs
+provider = st.session_state.get("provider_choice", "nominatim")
+loc_key = st.session_state.get("loc_key", "")
+oc_key = st.session_state.get("oc_key", "")
 
 # ------------------ Tab: Compare New vs Old ------------------
 with tabs[0]:
-    st.header("Compare New vs Old CSVs (by phone)")
-    st.info("Upload Old files and New files, select phone columns for each BEFORE processing. After processing you'll get cleaned New files and previews of removed rows.")
-    col1, col2 = st.columns([1,1])
-
-    with col1:
-        old_files = st.file_uploader("Upload Old CSV file(s)", type=["csv"], accept_multiple_files=True, key="old_files_tab")
-    with col2:
-        new_files = st.file_uploader("Upload New CSV file(s)", type=["csv"], accept_multiple_files=True, key="new_files_tab")
+    st.header("Compare New vs Old (by phone)")
+    st.info("Upload Old and New CSVs. The app tries to auto-select a phone column if it exists (you can still change it). Select columns BEFORE pressing Process.")
+    col_a, col_b = st.columns([1,1])
+    with col_a:
+        old_files = st.file_uploader("Upload Old CSV(s)", type=["csv"], accept_multiple_files=True, key="old_tab_files")
+    with col_b:
+        new_files = st.file_uploader("Upload New CSV(s)", type=["csv"], accept_multiple_files=True, key="new_tab_files")
 
     old_cols = {}
     if old_files:
-        st.markdown("**Select phone column for each Old file**")
+        st.markdown("**Old files — choose phone column (auto-selected if possible)**")
         for f in old_files:
             try:
-                df_old_sample = robust_read_csv(f)
-                old_cols[f.name] = st.selectbox(f"{f.name} phone column", df_old_sample.columns.tolist(), key=f"oldcol_{f.name}")
+                df_ = robust_read_csv(f)
+                auto = select_phone_column_auto(df_.columns.tolist())
+                default_index = df_.columns.tolist().index(auto) if auto in df_.columns.tolist() else 0
+                # use selectbox with index set to auto if found
+                old_cols[f.name] = st.selectbox(f"{f.name} phone column", df_.columns.tolist(), index=default_index if default_index < len(df_.columns) else 0, key=f"oldcol_sel_{f.name}")
             except Exception as e:
                 st.error(f"Can't read {f.name}: {e}")
 
     new_cols = {}
     if new_files:
-        st.markdown("**Select phone column for each New file**")
+        st.markdown("**New files — choose phone column (auto-selected if possible)**")
         for f in new_files:
             try:
-                df_new_sample = robust_read_csv(f)
-                new_cols[f.name] = st.selectbox(f"{f.name} phone column", df_new_sample.columns.tolist(), key=f"newcol_{f.name}")
+                df_ = robust_read_csv(f)
+                auto = select_phone_column_auto(df_.columns.tolist())
+                default_index = df_.columns.tolist().index(auto) if auto in df_.columns.tolist() else 0
+                new_cols[f.name] = st.selectbox(f"{f.name} phone column", df_.columns.tolist(), index=default_index if default_index < len(df_.columns) else 0, key=f"newcol_sel_{f.name}")
             except Exception as e:
                 st.error(f"Can't read {f.name}: {e}")
 
-    process_compare = st.button("Process Compare (New vs Old)")
+    if "removed_rows" not in st.session_state:
+        st.session_state["removed_rows"] = {}
 
-    if process_compare:
-        # basic validation
+    if st.button("Process Compare (New vs Old)"):
         if not old_files or not new_files:
             st.error("Please upload at least one Old file and one New file.")
         else:
-            # build set of normalized phones from Old files (only current batch)
+            # build old phones set
             old_phones = set()
-            st.write("Collecting phone numbers from Old files...")
+            st.write("Collecting phones from Old files...")
             for f in old_files:
                 try:
                     df_old = robust_read_csv(f)
                     col = old_cols.get(f.name)
-                    if col is None:
+                    if not col:
                         st.warning(f"No phone column selected for {f.name}; skipping.")
                         continue
                     phones = build_phone_series(df_old, col)
                     old_phones.update(phones[phones.str.len() > 0].tolist())
                 except Exception as e:
                     st.error(f"Error reading {f.name}: {e}")
-
-            st.success(f"Collected {len(old_phones)} unique normalized phone(s) from Old files.")
+            st.success(f"Collected {len(old_phones)} unique normalized phone(s).")
             st.write("---")
 
-            # process each New file
             for f in new_files:
                 try:
                     df_new = robust_read_csv(f)
                     col = new_cols.get(f.name)
-                    if col is None:
+                    if not col:
                         st.warning(f"No phone column selected for {f.name}; skipping.")
                         continue
                     df_new["_normalized_phone_for_check"] = build_phone_series(df_new, col)
                     mask = df_new["_normalized_phone_for_check"].isin(old_phones) & (df_new["_normalized_phone_for_check"].str.len() > 0)
                     removed_df = df_new.loc[mask].drop(columns=["_normalized_phone_for_check"])
                     cleaned_df = df_new.loc[~mask].drop(columns=["_normalized_phone_for_check"])
-
                     removed_count = int(mask.sum())
-                    st.info(f"For `{f.name}` — removed {removed_count} row(s) matching Old files.")
+                    st.info(f"For `{f.name}` removed {removed_count} row(s) matching Old files.")
+                    # store removed rows in session for preview
+                    st.session_state["removed_rows"][f.name] = removed_df.reset_index(drop=True)
+                    # preview small sample
                     if removed_count > 0:
-                        # store removed rows in session_state for persistent preview
-                        st.session_state["removed_rows"][f.name] = removed_df.reset_index(drop=True)
-                        # show a small preview
                         st.dataframe(removed_df.head(200))
-                    else:
-                        # store empty df too, so preview checkbox can show "No rows removed"
-                        st.session_state["removed_rows"][f.name] = removed_df.reset_index(drop=True)
-
-                    # provide cleaned download
-                    if cleaned_df.empty:
-                        st.warning(f"After removing matches, cleaned file for `{f.name}` is empty.")
+                    # downloads
                     create_download_button(cleaned_df, f"update_{f.name}", label=f"Download cleaned `{f.name}`")
                 except Exception as e:
                     st.error(f"Failed to process `{f.name}`: {e}")
 
-    # Preview checkboxes (outside processing block so they persist and respond without recompute)
+    # Previews from previous process run
     if st.session_state["removed_rows"]:
         st.write("---")
-        st.markdown("**Preview removed rows (from last Process Compare run):**")
+        st.markdown("**Removed rows from last run (preview & download)**")
         for fname, df_removed in st.session_state["removed_rows"].items():
-            # show checkbox for each file
-            checkbox_key = f"preview_removed_{fname}"
-            if st.checkbox(f"Show removed rows for `{fname}`", key=checkbox_key):
+            ck = st.checkbox(f"Show removed rows for `{fname}`", key=f"preview_removed_{fname}")
+            if ck:
                 if df_removed is None or df_removed.empty:
-                    st.info("No rows were removed for this file.")
+                    st.info("No rows removed for this file.")
                 else:
                     st.dataframe(df_removed.head(500))
-                    # also allow download of removed rows
                     create_download_button(df_removed, f"removed_rows_{fname}", label=f"Download removed rows `{fname}`")
 
 # ------------------ Tab: Internal Duplicate Remover ------------------
 with tabs[1]:
     st.header("Internal Duplicate Remover (single file)")
-    single = st.file_uploader("Upload a single CSV", type=["csv"], key="single_file_tab")
+    single = st.file_uploader("Upload a single CSV", type=["csv"], key="single_tab_file")
     if single:
         try:
             df_single = robust_read_csv(single)
             st.write(f"Columns: {', '.join(df_single.columns.tolist()[:20])}{'...' if len(df_single.columns)>20 else ''}")
-            phone_col = st.selectbox("Select phone column", df_single.columns.tolist(), key="single_phone_col")
+            auto = select_phone_column_auto(df_single.columns.tolist())
+            default_index = df_single.columns.tolist().index(auto) if auto in df_single.columns.tolist() else 0
+            phone_col = st.selectbox("Select phone column", df_single.columns.tolist(), index=default_index if default_index < len(df_single.columns) else 0, key="single_phone_col")
             df_single["_normalized_phone_for_check"] = build_phone_series(df_single, phone_col)
             dup_mask = df_single["_normalized_phone_for_check"].duplicated(keep="first") & (df_single["_normalized_phone_for_check"].str.len() > 0)
             removed_df = df_single.loc[dup_mask].drop(columns=["_normalized_phone_for_check"])
             cleaned_df = df_single.loc[~dup_mask].drop(columns=["_normalized_phone_for_check"])
             removed_count = int(dup_mask.sum())
             st.info(f"Removed {removed_count} duplicate row(s) in this file.")
-            # store and preview
             st.session_state["removed_single"] = removed_df.reset_index(drop=True)
             if removed_count > 0:
                 st.dataframe(removed_df.head(200))
                 create_download_button(removed_df, f"removed_duplicates_{single.name}", label="Download removed duplicates")
-            # cleaned download
             create_download_button(cleaned_df, f"update_{single.name}", label="Download cleaned file (duplicates removed)")
         except Exception as e:
             st.error(f"Failed to read/process file: {e}")
 
 # ------------------ Tab: Filter by Radius ------------------
 with tabs[2]:
-    st.header("Filter CSV rows within a radius of point A")
-    st.info("Filter rows that are within a radius (km) of a reference point. Use lat/lon columns or address (+ optional pincode) with Nominatim geocoding.")
-    radius_file = st.file_uploader("Upload CSV to filter", type=["csv"], key="radius_file_tab")
+    st.header("Filter rows within a radius of point A")
+    st.info("You can use lat/lon columns, or address + optional pincode. Choose geocoding provider in Settings tab.")
 
+    radius_file = st.file_uploader("Upload CSV to filter", type=["csv"], key="radius_tab_file")
     if radius_file:
         try:
             df_radius = robust_read_csv(radius_file)
             st.write(f"Columns: {', '.join(df_radius.columns.tolist()[:20])}{'...' if len(df_radius.columns)>20 else ''}")
-            method = st.radio("Method", ["Latitude & Longitude columns", "Address / Pincode column"], key="radius_method")
+            method = st.radio("Method", ["Latitude & Longitude columns", "Address / Pincode column"], key="radius_method_choice")
 
             if method == "Latitude & Longitude columns":
-                lat_col = st.selectbox("Latitude column", df_radius.columns.tolist(), key="latcol")
-                lon_col = st.selectbox("Longitude column", df_radius.columns.tolist(), key="loncol")
-                ref_lat = st.number_input("Reference latitude", value=30.7333, format="%.6f", key="ref_lat")
-                ref_lon = st.number_input("Reference longitude", value=76.7794, format="%.6f", key="ref_lon")
-                radius_km = st.number_input("Radius (km)", value=20.0, step=1.0, key="radius_km")
+                lat_col = st.selectbox("Latitude column", df_radius.columns.tolist(), key="radius_lat_col")
+                lon_col = st.selectbox("Longitude column", df_radius.columns.tolist(), key="radius_lon_col")
+                ref_lat = st.number_input("Reference latitude", value=30.7333, key="radius_ref_lat")
+                ref_lon = st.number_input("Reference longitude", value=76.7794, key="radius_ref_lon")
+                radius_km = st.number_input("Radius (km)", value=20.0, step=1.0, key="radius_km_input")
 
-                if st.button("Filter by Radius (Lat/Lon)", key="filter_latlon_btn"):
-                    # calculate distances (handle missing / non-numeric gracefully)
+                if st.button("Filter by Radius (Lat/Lon)", key="filter_latlon_button"):
                     try:
-                        distances = haversine_np(ref_lat, ref_lon, pd.to_numeric(df_radius[lat_col], errors="coerce"), pd.to_numeric(df_radius[lon_col], errors="coerce"))
+                        distances = haversine_np(ref_lat, ref_lon, df_radius[lat_col], df_radius[lon_col])
                         df_radius['__distance_km__'] = distances
                         inside = df_radius[df_radius['__distance_km__'] <= radius_km].reset_index(drop=True)
                         outside = df_radius[df_radius['__distance_km__'] > radius_km].reset_index(drop=True)
-                        st.success(f"Found {len(inside)} row(s) inside radius and {len(outside)} row(s) outside radius.")
-                        # store in session_state
+                        st.success(f"Found {len(inside)} row(s) inside and {len(outside)} row(s) outside radius.")
                         st.session_state["radius_results"][radius_file.name] = (inside, outside)
-                        # downloads
                         if len(inside) > 0:
                             create_download_button(inside.drop(columns=['__distance_km__'], errors='ignore'), f"inside_radius_{radius_file.name}", label=f"Download inside_radius_{radius_file.name}")
                         if len(outside) > 0:
                             create_download_button(outside.drop(columns=['__distance_km__'], errors='ignore'), f"outside_radius_{radius_file.name}", label=f"Download outside_radius_{radius_file.name}")
-                        # preview
                         if len(inside) > 0:
-                            st.subheader("Preview: rows inside radius")
+                            st.subheader("Preview: inside radius")
                             st.dataframe(inside.head(500))
                         if len(outside) > 0:
-                            st.subheader("Preview: rows outside radius")
+                            st.subheader("Preview: outside radius")
                             st.dataframe(outside.head(500))
                     except Exception as e:
                         st.error(f"Failed to compute distances: {e}")
 
             else:
                 # Address / Pincode branch
-                addr_col = st.selectbox("Address column", df_radius.columns.tolist(), key="addrcol")
-                # include None + columns for optional pincode selection
+                addr_col = st.selectbox("Address column", df_radius.columns.tolist(), key="radius_addr_col")
                 pincode_options = [None] + df_radius.columns.tolist()
-                pincode_col = st.selectbox("Pincode column (optional)", pincode_options, index=0, key="pincodecol")
-                ref_lat = st.number_input("Reference latitude", value=30.7333, format="%.6f", key="addr_ref_lat")
-                ref_lon = st.number_input("Reference longitude", value=76.7794, format="%.6f", key="addr_ref_lon")
-                radius_km = st.number_input("Radius (km)", value=20.0, step=1.0, key="addr_radius_km")
+                pincode_col = st.selectbox("Pincode column (optional)", pincode_options, index=0, key="radius_pin_col")
+                ref_lat = st.number_input("Reference latitude", value=30.7333, key="addr_ref_lat_input")
+                ref_lon = st.number_input("Reference longitude", value=76.7794, key="addr_ref_lon_input")
+                radius_km = st.number_input("Radius (km)", value=20.0, step=1.0, key="addr_radius_km_input")
 
-                if st.button("Filter by Radius (Address)", key="filter_addr_btn"):
-                    # build address strings and geocode unique addresses
-                    st.write("Geocoding addresses (using Nominatim). Results are cached to reduce repeated calls.")
-                    addresses = []
+                if st.button("Filter by Radius (Address)", key="filter_addr_button"):
+                    # prepare address queries and unique list
                     queries = []
                     for idx, row in df_radius.iterrows():
                         addr = "" if pd.isna(row.get(addr_col, "")) else str(row.get(addr_col, "")).strip()
@@ -320,29 +381,48 @@ with tabs[2]:
                             val = row.get(pincode_col)
                             if pd.notna(val) and str(val).strip() != "":
                                 pin = str(val).strip()
-                        if pin:
-                            q = f"{addr} {pin}"
-                        else:
-                            q = addr
-                        addresses.append((idx, q))
+                        q = f"{addr} {pin}" if pin else addr
                         queries.append(q)
 
-                    # geocode unique queries only
-                    unique_queries = list(dict.fromkeys(queries))  # preserves order
-                    st.write(f"Geocoding {len(unique_queries)} unique address strings...")
-                    geocode_map = {}
-                    progress_bar = st.progress(0)
-                    for i, q in enumerate(unique_queries):
-                        lat_lon = geocode_nominatim(q)
-                        geocode_map[q] = lat_lon
-                        # progress update
-                        progress_bar.progress(int((i + 1) / len(unique_queries) * 100))
-                    progress_bar.empty()
+                    unique_queries = list(dict.fromkeys(queries))  # preserve order, unique
+                    st.write(f"Geocoding {len(unique_queries)} unique address strings using `{provider}` provider...")
 
-                    # assemble lat/lon arrays in same order as df_radius
+                    # progress bar + timing
+                    progress = st.progress(0)
+                    geocode_map = {}
+                    total = len(unique_queries)
+                    start_time = time.time()
+
+                    for i, q in enumerate(unique_queries):
+                        if provider == "nominatim":
+                            # respect Nominatim usage policy ~1 req/sec
+                            latlon = geocode_dispatch(q, "nominatim")
+                            geocode_map[q] = latlon
+                            # small sleep to be polite / respect rate-limit
+                            time.sleep(1.0)
+                        elif provider == "locationiq":
+                            latlon = geocode_dispatch(q, "locationiq", api_key=loc_key)
+                            geocode_map[q] = latlon
+                            # slight pause to avoid hitting free-tier burst limits
+                            time.sleep(0.1)
+                        elif provider == "opencage":
+                            latlon = geocode_dispatch(q, "opencage", api_key=oc_key)
+                            geocode_map[q] = latlon
+                            time.sleep(0.1)
+                        else:
+                            geocode_map[q] = (None, None)
+
+                        # update progress
+                        elapsed = time.time() - start_time
+                        completed = i + 1
+                        progress.progress(int(completed / total * 100))
+
+                    progress.empty()
+
+                    # map lat/lon back to df_radius rows
                     lat_list = []
                     lon_list = []
-                    for idx, q in addresses:
+                    for q in queries:
                         lat, lon = geocode_map.get(q, (None, None))
                         lat_list.append(lat)
                         lon_list.append(lon)
@@ -350,20 +430,17 @@ with tabs[2]:
                     df_radius['__geocoded_lat__'] = lat_list
                     df_radius['__geocoded_lon__'] = lon_list
 
-                    # filter rows with missing lat/lon: considered 'outside' (or you can treat separately)
-                    # compute distance for rows with valid coords
                     valid_mask = df_radius['__geocoded_lat__'].notna() & df_radius['__geocoded_lon__'].notna()
                     if valid_mask.sum() == 0:
-                        st.warning("No valid geocoded coordinates found for any row. Check address/pincode data or try smaller batch.")
-                    # compute distances (non-valid will become NaN)
+                        st.warning("No rows could be geocoded successfully. Check addresses / API limits.")
+                    # compute distances for valid rows
                     df_radius.loc[valid_mask, '__distance_km__'] = haversine_np(ref_lat, ref_lon, df_radius.loc[valid_mask, '__geocoded_lat__'], df_radius.loc[valid_mask, '__geocoded_lon__'])
                     df_radius.loc[~valid_mask, '__distance_km__'] = np.nan
 
                     inside = df_radius[df_radius['__distance_km__'] <= radius_km].reset_index(drop=True)
                     outside = df_radius[(df_radius['__distance_km__'] > radius_km) | (df_radius['__distance_km__'].isna())].reset_index(drop=True)
 
-                    st.success(f"Found {len(inside)} row(s) inside radius and {len(outside)} row(s) outside or not-geocoded.")
-                    # store results
+                    st.success(f"Geocoding complete. Found {len(inside)} inside, {len(outside)} outside (includes not-geocoded).")
                     st.session_state["radius_results"][radius_file.name] = (inside, outside)
 
                     # downloads
@@ -374,10 +451,10 @@ with tabs[2]:
 
                     # previews
                     if len(inside) > 0:
-                        st.subheader("Preview: rows inside radius")
+                        st.subheader("Preview: inside radius")
                         st.dataframe(inside.head(500))
                     if len(outside) > 0:
-                        st.subheader("Preview: rows outside radius (includes not-geocoded rows)")
+                        st.subheader("Preview: outside radius (includes not-geocoded)")
                         st.dataframe(outside.head(500))
 
         except Exception as e:
@@ -386,7 +463,7 @@ with tabs[2]:
     # Show previous radius results and let user preview / download again
     if st.session_state["radius_results"]:
         st.write("---")
-        st.markdown("**Previous radius results (from this session):**")
+        st.markdown("**Saved radius results (this session)**")
         for fname, (inside_df, outside_df) in st.session_state["radius_results"].items():
             st.markdown(f"**{fname}** — inside: {len(inside_df)} rows, outside: {len(outside_df)} rows")
             if st.checkbox(f"Show inside rows for `{fname}`", key=f"show_inside_{fname}"):
@@ -402,13 +479,12 @@ with tabs[2]:
                 else:
                     st.info("No rows outside radius for this file.")
 
-# ------------------ Footer / Notes ------------------
-
+# ------------------ Footer Notes ------------------
 st.markdown("---")
 st.markdown("**Notes & recommendations**")
 st.markdown("""
-- Geocoding uses the free Nominatim service (OpenStreetMap). Be kind: cache results (this app caches by query), avoid heavy rapid batches, and consider obtaining your own geocoding key for high-volume work.  
-- Address geocoding can be imperfect — review `outside` results that are 'not geocoded' (missing coords).  
-- Phone normalization keeps the **last 10 digits** (useful for matching Indian mobile numbers with country code). Change `normalize_phone` if you need a different rule.  
-- If you have very large files (10k+ rows), consider splitting into smaller batches to avoid geocoding rate limits or switch to a paid geocoding provider (LocationIQ, OpenCage, Google) for bulk operations.
+- Nominatim is free but rate-limited (please respect ~1 request/sec). This app enforces ~1s sleep between Nominatim calls when geocoding batches.
+- For higher volume geocoding, use LocationIQ or OpenCage (enter API keys in Settings). The app uses their APIs if keys are provided.
+- Geocoding quality varies by address formatting. You may want to pre-clean addresses (normalize city names, include pincode) for better accuracy.
+- Phone normalization keeps last 10 digits; change `normalize_phone` if you need different behaviour.
 """)
