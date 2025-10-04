@@ -1,4 +1,4 @@
-# csv_tool_full_enhanced.py
+# csv_tool_full_enhanced_rate_limited.py
 import streamlit as st
 import pandas as pd
 import io
@@ -10,7 +10,7 @@ import time
 from io import StringIO
 from typing import Tuple
 
-st.set_page_config(page_title="CSV Duplicate & Geofilter Checker (Enhanced)", layout="wide")
+st.set_page_config(page_title="CSV Duplicate & Geofilter Checker (Rate-Limited)", layout="wide")
 
 # ------------------ Helpers ------------------
 
@@ -98,7 +98,7 @@ def haversine_np(lat1, lon1, lat2, lon2):
     c = 2 * np.arcsin(np.sqrt(a))
     return R * c
 
-# ------------------ Geocoding backends ------------------
+# ------------------ Geocoding backends (cached) ------------------
 
 @st.cache_data(show_spinner=False)
 def geocode_nominatim(query: str) -> Tuple[float, float]:
@@ -116,8 +116,6 @@ def geocode_nominatim(query: str) -> Tuple[float, float]:
 
 @st.cache_data(show_spinner=False)
 def geocode_locationiq(query: str, api_key: str) -> Tuple[float, float]:
-    # LocationIQ endpoint (forward geocoding)
-    # Docs: https://locationiq.com/docs
     url = "https://us1.locationiq.com/v1/search.php"
     params = {"key": api_key, "q": query, "format": "json", "limit": 1}
     try:
@@ -146,7 +144,7 @@ def geocode_opencage(query: str, api_key: str) -> Tuple[float, float]:
     return None, None
 
 def geocode_dispatch(query: str, provider: str, api_key: str = None) -> Tuple[float, float]:
-    """Dispatch geocoding to chosen provider; caches used via specific cached functions above."""
+    """Dispatch geocoding to chosen provider; uses cached functions above."""
     if provider == "nominatim":
         return geocode_nominatim(query)
     elif provider == "locationiq":
@@ -171,14 +169,14 @@ if "radius_results" not in st.session_state:
 
 # ------------------ App UI ------------------
 
-st.title("CSV Duplicate & Geofilter Checker — Enhanced")
+st.title("CSV Duplicate & Geofilter Checker — Rate-Limited")
 st.markdown("""
 Features:
 - Compare New vs Old CSVs by phone (auto-detect phone columns, or choose manually).  
 - Internal duplicate remover (single file).  
 - Filter by radius using lat/lon or address+pincode with geocoding.  
 - Choose geocoding provider (Nominatim, LocationIQ, OpenCage) and supply API key if needed.  
-- Caches geocoding responses and shows progress for batch geocoding.
+- Caches geocoding responses and enforces rate limits when geocoding batches.
 """)
 
 tabs = st.tabs(["Compare New vs Old", "Internal Duplicate Remover", "Filter by Radius", "Settings"])
@@ -194,13 +192,20 @@ with tabs[3]:
     st.markdown("""
     Recommendations:
     - For small quick tests, **Nominatim** (free) is fine. Respect 1 request/sec.
-    - For larger batches, use **LocationIQ** (10k/month free tier) or **OpenCage** (free tier), enter API key above.
+    - For larger batches, use **LocationIQ** (5,000/day, 2/sec) or **OpenCage** (free tier), enter API key above.
     """)
 
-# Ensure provider selection is available in session for other tabs
+# read provider and keys from session_state
 provider = st.session_state.get("provider_choice", "nominatim")
 loc_key = st.session_state.get("loc_key", "")
 oc_key = st.session_state.get("oc_key", "")
+
+# rate limits per provider (seconds between requests)
+RATE_LIMITS = {
+    "nominatim": 1.0,   # 1 req/sec
+    "locationiq": 0.5,  # 2 req/sec
+    "opencage": 0.2     # ~5 req/sec (adjust if needed)
+}
 
 # ------------------ Tab: Compare New vs Old ------------------
 with tabs[0]:
@@ -220,7 +225,6 @@ with tabs[0]:
                 df_ = robust_read_csv(f)
                 auto = select_phone_column_auto(df_.columns.tolist())
                 default_index = df_.columns.tolist().index(auto) if auto in df_.columns.tolist() else 0
-                # use selectbox with index set to auto if found
                 old_cols[f.name] = st.selectbox(f"{f.name} phone column", df_.columns.tolist(), index=default_index if default_index < len(df_.columns) else 0, key=f"oldcol_sel_{f.name}")
             except Exception as e:
                 st.error(f"Can't read {f.name}: {e}")
@@ -274,12 +278,9 @@ with tabs[0]:
                     cleaned_df = df_new.loc[~mask].drop(columns=["_normalized_phone_for_check"])
                     removed_count = int(mask.sum())
                     st.info(f"For `{f.name}` removed {removed_count} row(s) matching Old files.")
-                    # store removed rows in session for preview
                     st.session_state["removed_rows"][f.name] = removed_df.reset_index(drop=True)
-                    # preview small sample
                     if removed_count > 0:
                         st.dataframe(removed_df.head(200))
-                    # downloads
                     create_download_button(cleaned_df, f"update_{f.name}", label=f"Download cleaned `{f.name}`")
                 except Exception as e:
                     st.error(f"Failed to process `{f.name}`: {e}")
@@ -393,24 +394,18 @@ with tabs[2]:
                     total = len(unique_queries)
                     start_time = time.time()
 
+                    # determine per-provider rate limit
+                    per_request_delay = RATE_LIMITS.get(provider, 1.0)
+
                     for i, q in enumerate(unique_queries):
-                        if provider == "nominatim":
-                            # respect Nominatim usage policy ~1 req/sec
-                            latlon = geocode_dispatch(q, "nominatim")
-                            geocode_map[q] = latlon
-                            # small sleep to be polite / respect rate-limit
-                            time.sleep(1.0)
-                        elif provider == "locationiq":
-                            latlon = geocode_dispatch(q, "locationiq", api_key=loc_key)
-                            geocode_map[q] = latlon
-                            # slight pause to avoid hitting free-tier burst limits
-                            time.sleep(0.1)
-                        elif provider == "opencage":
-                            latlon = geocode_dispatch(q, "opencage", api_key=oc_key)
-                            geocode_map[q] = latlon
-                            time.sleep(0.1)
-                        else:
-                            geocode_map[q] = (None, None)
+                        # call geocode (cached functions will avoid network if previously fetched)
+                        latlon = geocode_dispatch(q, provider, api_key=loc_key if provider == "locationiq" else (oc_key if provider == "opencage" else None))
+                        geocode_map[q] = latlon
+
+                        # Respect provider rate limits by sleeping after each network call.
+                        # We sleep per_request_delay seconds to ensure we don't exceed provider limits.
+                        # Note: If geocode_dispatch returned from cache, sleep still keeps polite pacing.
+                        time.sleep(per_request_delay)
 
                         # update progress
                         elapsed = time.time() - start_time
@@ -482,9 +477,12 @@ with tabs[2]:
 # ------------------ Footer Notes ------------------
 st.markdown("---")
 st.markdown("**Notes & recommendations**")
-st.markdown("""
-- Nominatim is free but rate-limited (please respect ~1 request/sec). This app enforces ~1s sleep between Nominatim calls when geocoding batches.
-- For higher volume geocoding, use LocationIQ or OpenCage (enter API keys in Settings). The app uses their APIs if keys are provided.
-- Geocoding quality varies by address formatting. You may want to pre-clean addresses (normalize city names, include pincode) for better accuracy.
-- Phone normalization keeps last 10 digits; change `normalize_phone` if you need different behaviour.
+st.markdown(f"""
+- Rate limiting: this app enforces per-provider delays:
+  - Nominatim: {RATE_LIMITS['nominatim']} s between requests (~1 req/sec)
+  - LocationIQ: {RATE_LIMITS['locationiq']} s between requests (~2 req/sec)
+  - OpenCage: {RATE_LIMITS['opencage']} s between requests (~5 req/sec)
+- Nominatim is free but rate-limited; use LocationIQ/OpenCage with API keys for larger batches.
+- Geocoding results are cached by query; repeated runs with the same queries will use cached results.
+- For very large datasets (thousands of rows), consider pre-geocoding addresses offline or using a paid geocoding plan.
 """)
