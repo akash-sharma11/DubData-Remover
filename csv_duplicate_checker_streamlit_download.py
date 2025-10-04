@@ -50,7 +50,7 @@ st.title("CSV Duplicate Checker — by Phone Number")
 st.markdown("""
 Upload **New CSV file(s)** and **Old CSV file(s)**. The app will:
 - Remove from each New file any rows whose phone numbers appear in the uploaded Old files.  
-- You can preview the removed rows for each New file.  
+- Preview removed rows and see how many were removed.  
 - Cleaned New files can be downloaded directly.
 """)
 
@@ -121,6 +121,9 @@ with tabs[0]:
                     cleaned_df = df_new.loc[~mask_in_old].drop(columns=["_normalized_phone_for_check"])
                     cleaned_name = f"update_{f.name}"
 
+                    # show number of rows removed
+                    st.info(f"Removed {len(removed_rows)} row(s) from `{f.name}` matching old data.")
+
                     if cleaned_df.empty:
                         st.warning(f"After removing duplicates, `{cleaned_name}` is empty.")
                     else:
@@ -133,7 +136,6 @@ with tabs[0]:
                     st.error(f"Failed to process `{f.name}`: {e}")
 
     # ------------------------- SHOW PREVIEWS -------------------------
-    # Display preview checkboxes and render data from session_state
     if "removed_rows" in st.session_state:
         for fname, removed_df in st.session_state["removed_rows"].items():
             if st.checkbox(f"Show removed rows preview for `{fname}`", key=f"preview_{fname}"):
@@ -159,6 +161,9 @@ with tabs[1]:
             removed_rows = df_single.loc[duplicated_mask].drop(columns=["_normalized_phone_for_check"])
             cleaned_df = df_single.loc[~duplicated_mask].drop(columns=["_normalized_phone_for_check"])
             cleaned_name = f"update_{single_file.name}"
+
+            # show number of rows removed
+            st.info(f"Removed {len(removed_rows)} row(s) from `{single_file.name}` due to internal duplicates.")
 
             if cleaned_df.empty:
                 st.warning("After removing duplicates, resulting file is empty.")
