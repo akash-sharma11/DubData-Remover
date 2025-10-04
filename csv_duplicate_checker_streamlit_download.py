@@ -85,6 +85,10 @@ with tabs[0]:
                 except Exception as e:
                     st.error(f"Failed to read {f.name}: {e}")
 
+    # initialize session_state dict to store removed rows
+    if "removed_rows" not in st.session_state:
+        st.session_state["removed_rows"] = {}
+
     process_btn = st.button("Process Compare (New vs Old)")
 
     if process_btn:
@@ -112,6 +116,7 @@ with tabs[0]:
                     phones = build_phone_series(df_new, col_choice)
                     df_new["_normalized_phone_for_check"] = phones
                     mask_in_old = df_new["_normalized_phone_for_check"].isin(old_phones_set) & (df_new["_normalized_phone_for_check"].str.len()>0)
+                    
                     removed_rows = df_new.loc[mask_in_old].drop(columns=["_normalized_phone_for_check"])
                     cleaned_df = df_new.loc[~mask_in_old].drop(columns=["_normalized_phone_for_check"])
                     cleaned_name = f"update_{f.name}"
@@ -121,17 +126,21 @@ with tabs[0]:
                     else:
                         create_download_link(cleaned_df, cleaned_name)
 
-                    # store removed rows in session_state for preview
-                    key_removed = f"removed_{f.name}"
-                    st.session_state[key_removed] = removed_rows
-                    if st.checkbox(f"Show removed rows preview for `{f.name}`", key=f"show_removed_{f.name}"):
-                        if key_removed in st.session_state and not st.session_state[key_removed].empty:
-                            st.dataframe(st.session_state[key_removed].head(200))
-                        else:
-                            st.info("No rows removed for this file.")
+                    # STORE REMOVED ROWS IN SESSION_STATE
+                    st.session_state["removed_rows"][f.name] = removed_rows
 
                 except Exception as e:
                     st.error(f"Failed to process `{f.name}`: {e}")
+
+    # ------------------------- SHOW PREVIEWS -------------------------
+    # Display preview checkboxes and render data from session_state
+    if "removed_rows" in st.session_state:
+        for fname, removed_df in st.session_state["removed_rows"].items():
+            if st.checkbox(f"Show removed rows preview for `{fname}`", key=f"preview_{fname}"):
+                if not removed_df.empty:
+                    st.dataframe(removed_df.head(200))
+                else:
+                    st.info("No rows removed for this file.")
 
 # ---------------------------- Internal duplicates ----------------------------
 with tabs[1]:
@@ -157,11 +166,10 @@ with tabs[1]:
                 create_download_link(cleaned_df, cleaned_name)
 
             # store for preview
-            key_removed_single = f"removed_single"
-            st.session_state[key_removed_single] = removed_rows
+            st.session_state["removed_single"] = removed_rows
             if st.checkbox("Show removed duplicate rows preview", key="preview_internal_removed"):
-                if key_removed_single in st.session_state and not st.session_state[key_removed_single].empty:
-                    st.dataframe(st.session_state[key_removed_single].head(200))
+                if "removed_single" in st.session_state and not st.session_state["removed_single"].empty:
+                    st.dataframe(st.session_state["removed_single"].head(200))
                 else:
                     st.info("No duplicate rows removed.")
 
