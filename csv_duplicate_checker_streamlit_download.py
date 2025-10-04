@@ -2,9 +2,8 @@ import streamlit as st
 import pandas as pd
 import io
 import re
-import csv
 from io import StringIO
-from typing import List
+import csv
 
 st.set_page_config(page_title="CSV Duplicate Checker by Phone", layout="wide")
 
@@ -49,10 +48,10 @@ def create_download_link(df: pd.DataFrame, filename: str):
 # ---------------------------- UI ----------------------------
 st.title("CSV Duplicate Checker — by Phone Number")
 st.markdown("""
-Upload **New** CSV file(s) and **Old** CSV file(s). The app will:
-- Compare phone numbers from New files against Old files and remove records from New that exist in Old (based on normalized phone number).  
-- OR use the *Internal duplicates* tool to upload a single file and remove duplicate phone numbers inside that file.  
-- Cleaned file(s) will be available for download with filenames starting `update_<originalname>.csv`.
+Upload **New CSV file(s)** and **Old CSV file(s)**. The app will:
+- Remove from each New file any rows whose phone numbers appear in the uploaded Old files.  
+- You can preview the removed rows for each New file.  
+- Cleaned New files can be downloaded directly.
 """)
 
 tabs = st.tabs(["Compare New vs Old (multiple files)", "Internal duplicates (single file)"])
@@ -60,8 +59,8 @@ tabs = st.tabs(["Compare New vs Old (multiple files)", "Internal duplicates (sin
 # ---------------------------- Compare New vs Old ----------------------------
 with tabs[0]:
     st.header("Compare New vs Old")
-    st.info("Upload at least one Old file and at least one New file. Phone numbers are detected from a chosen column in each file; normalization removes non-digits and keeps last 10 digits if longer.")
-    
+    st.info("Upload at least one Old file and at least one New file. Select the phone column for each before processing.")
+
     col1, col2 = st.columns([1,1])
     
     with col1:
@@ -92,92 +91,88 @@ with tabs[0]:
         if not old_files or not new_files:
             st.error("Please upload at least one Old file and at least one New file.")
         else:
-            # Combine all old phones
+            # combine old phones
             old_phones_set = set()
-            st.write("Reading Old files and collecting phone numbers...")
             for f in old_files:
                 try:
                     df_old = read_csv_file(f)
                     col_choice = old_cols[f.name]
                     phones = build_phone_series(df_old, col_choice)
-                    count_nonempty = phones.str.len().astype(int).gt(0).sum()
-                    st.write(f"Collected {count_nonempty} phone entries from {f.name}.")
                     old_phones_set.update(phones[phones.str.len()>0].tolist())
                 except Exception as e:
                     st.error(f"Failed to process {f.name}: {e}")
-
             st.success(f"Total unique normalized phone numbers in Old files: {len(old_phones_set)}")
             st.write("---")
 
-            # Process each new file
+            # process each new file
             for f in new_files:
                 try:
                     df_new = read_csv_file(f)
-                    new_col_choice = new_cols[f.name]
-                    new_phones = build_phone_series(df_new, new_col_choice)
-                    df_new["_normalized_phone_for_check"] = new_phones
+                    col_choice = new_cols[f.name]
+                    phones = build_phone_series(df_new, col_choice)
+                    df_new["_normalized_phone_for_check"] = phones
                     mask_in_old = df_new["_normalized_phone_for_check"].isin(old_phones_set) & (df_new["_normalized_phone_for_check"].str.len()>0)
-                    found_count = mask_in_old.sum()
-                    st.write(f"Found {found_count} rows in `{f.name}` that match phones from Old files.")
-
+                    removed_rows = df_new.loc[mask_in_old].drop(columns=["_normalized_phone_for_check"])
                     cleaned_df = df_new.loc[~mask_in_old].drop(columns=["_normalized_phone_for_check"])
                     cleaned_name = f"update_{f.name}"
+
                     if cleaned_df.empty:
                         st.warning(f"After removing duplicates, `{cleaned_name}` is empty.")
                     else:
                         create_download_link(cleaned_df, cleaned_name)
 
-                    # Store removed rows in session state for checkbox preview
-                    if found_count > 0:
-                        key_removed = f"removed_rows_{f.name}"
-                        st.session_state[key_removed] = df_new.loc[mask_in_old].drop(columns=["_normalized_phone_for_check"])
-                        show_preview = st.checkbox(f"Show removed rows preview for `{f.name}`", key=f"show_removed_{f.name}")
-                        if show_preview and key_removed in st.session_state:
+                    # store removed rows in session_state for preview
+                    key_removed = f"removed_{f.name}"
+                    st.session_state[key_removed] = removed_rows
+                    if st.checkbox(f"Show removed rows preview for `{f.name}`", key=f"show_removed_{f.name}"):
+                        if key_removed in st.session_state and not st.session_state[key_removed].empty:
                             st.dataframe(st.session_state[key_removed].head(200))
+                        else:
+                            st.info("No rows removed for this file.")
 
                 except Exception as e:
-                    st.error(f"Failed to process {f.name}: {e}")
+                    st.error(f"Failed to process `{f.name}`: {e}")
 
 # ---------------------------- Internal duplicates ----------------------------
 with tabs[1]:
     st.header("Internal Duplicate Remover (single file)")
-    st.info("Upload one CSV file and the app will detect repeated phone numbers inside the file and produce a cleaned CSV named `update_<originalname>.csv`.")
-    
+    st.info("Upload one CSV file and remove duplicate phone numbers inside the file.")
+
     single_file = st.file_uploader("Upload a single CSV file", type=["csv"], accept_multiple_files=False, key="single_file")
     if single_file:
         try:
             df_single = read_csv_file(single_file)
             st.write(f"Columns: {', '.join(df_single.columns.tolist()[:20])}{'...' if len(df_single.columns)>20 else ''}")
-            phone_col = st.selectbox("Select phone column to check for duplicates", options=df_single.columns.tolist(), key="single_phone_col")
+            phone_col = st.selectbox("Select phone column", options=df_single.columns.tolist(), key="single_phone_col")
             phones = build_phone_series(df_single, phone_col)
             df_single["_normalized_phone_for_check"] = phones
             duplicated_mask = df_single["_normalized_phone_for_check"].duplicated(keep="first") & (df_single["_normalized_phone_for_check"].str.len()>0)
-            total_duplicates = duplicated_mask.sum()
-            st.write(f"Found {total_duplicates} duplicate rows (same normalized phone) inside the file.")
-
+            removed_rows = df_single.loc[duplicated_mask].drop(columns=["_normalized_phone_for_check"])
             cleaned_df = df_single.loc[~duplicated_mask].drop(columns=["_normalized_phone_for_check"])
             cleaned_name = f"update_{single_file.name}"
+
             if cleaned_df.empty:
                 st.warning("After removing duplicates, resulting file is empty.")
             else:
                 create_download_link(cleaned_df, cleaned_name)
 
-            # Store removed rows for preview
-            if total_duplicates > 0:
-                key_removed_single = f"removed_rows_single"
-                st.session_state[key_removed_single] = df_single.loc[duplicated_mask].drop(columns=["_normalized_phone_for_check"])
-                show_preview_single = st.checkbox("Show removed duplicate rows preview", key="preview_internal_removed")
-                if show_preview_single and key_removed_single in st.session_state:
+            # store for preview
+            key_removed_single = f"removed_single"
+            st.session_state[key_removed_single] = removed_rows
+            if st.checkbox("Show removed duplicate rows preview", key="preview_internal_removed"):
+                if key_removed_single in st.session_state and not st.session_state[key_removed_single].empty:
                     st.dataframe(st.session_state[key_removed_single].head(200))
+                else:
+                    st.info("No duplicate rows removed.")
 
         except Exception as e:
-            st.error(f"Failed to read or process file: {e}")
+            st.error(f"Failed to read/process file: {e}")
 
 # ---------------------------- Notes ----------------------------
 st.markdown("---")
 st.markdown("**Notes & heuristics**")
 st.markdown("""
-- Phone normalization removes non-digit characters. If a phone number has more than 10 digits, the app keeps the **last 10 digits**.  
-- The app relies on selecting the correct phone column.  
+- Phone normalization removes non-digit characters and keeps the last 10 digits.  
+- For Compare New vs Old, only the **currently uploaded Old files** are used to remove matches from New files.  
 - Cleaned CSV files are named `update_<original_filename>.csv`.
 """)
